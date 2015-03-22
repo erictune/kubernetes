@@ -33,6 +33,8 @@ write_files:
         echo "Unpacking release"
         rm -rf /opt/kubernetes || false
         tar xzf /opt/kubernetes.tar.gz -C /opt/
+      else
+        echo "kubernetes release found. Skipping download."
       fi
   - path: /opt/.kubernetes_auth
     permissions: 0600

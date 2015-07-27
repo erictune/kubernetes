@@ -1,0 +1,7 @@
+.key1: value1
+.key2.key3.key4.key5: value5
+.key6.key7.0.key8: value8
+.key6.key7.0.key9: value9
+.key6.key7.1.key8: value8b
+.key6.key7.1.key9: value9b
+.key6.key10: value10

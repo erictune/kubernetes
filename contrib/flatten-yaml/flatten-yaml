@@ -1,0 +1,111 @@
+#!/usr/bin/env python
+
+# Copyright YEAR The Kubernetes Authors All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Reads in a YAML file and prints out a "flattened" representation.
+#
+# Flattened representation has a "fully-qualified" name for each
+# item, suitable for using in line-by-line operations
+# such as sorting and diffing.
+#
+# Only supports limited subset of YAML:
+#  - no single-line list or map styles
+#  - no multi-line values
+#
+# Example usage:
+# cat file1.yaml | flatten-yaml
+# Example of diffing:
+# diff <(cat file1.yaml | flatten-yaml | sort) <(cat file2.yaml | flatten-yaml | sort)
+
+import sys
+# Map that remembers the key for previous lines which had this much
+# indent (need to remember more than just the previous prefix
+# since a dedent might go back several levels)
+prefixByIndent = {0 : "$"}
+# Index of the previous array element at this level of indent
+indexByIndent = {}
+prevFullKey = ""
+prevParentKey = ""
+prevIndent = 0
+
+def processLine(indent, line):
+  global prefixByIndent
+  global indexByIndent
+  global prevFullKey
+  global prevParentKey
+  global prevIndent
+
+  key, value = line.split(":", 1)
+  #print "--->", indent, prevIndent
+  if indent > prevIndent:
+    # We indented more, so we are a child of the previous line.
+    # TODO: handle multiline styles.
+    parentKey = prevFullKey
+  elif indent < prevIndent:
+    # We are a sibling of the previous thing with this indent level.
+    if indent not in prefixByIndent:
+      print "No matching indent level!"
+      sys.exit(1)
+    siblingFullKey = prefixByIndent[indent]
+    siblingParts = siblingFullKey.split(".")
+    siblingKey = siblingParts[-1]
+    # Compute parent from sibling key
+    parentKey = ".".join((siblingParts[:-1]))
+    # If our sibling is an array index rather than a map key, then make our key be one more.
+    try:
+      key = str(int(siblingKey) + 1)
+    except ValueError:
+      pass
+    # We no longer care about things that are more indented than the current line.
+    prefixByIndent = dict((k, v) for (k, v) in prefixByIndent.iteritems() if k < indent)
+  else:
+    parentKey = prevParentKey
+  fullKey = parentKey + "." + key
+  # Don't print empty values, which are just keys that introduce a new block.
+  if value != "":
+    print fullKey + ":" + value
+  prevFullKey = fullKey
+  prevParentKey = parentKey
+  prevIndent = indent
+  # Remember this key as a prefix in case the next line is a sub-block of this one.
+  prefixByIndent[indent] = fullKey
+  # end of def processLine()
+
+for line in sys.stdin:
+  line = line.rstrip()
+  indent = len(line) - len(line.lstrip())
+  line = line.lstrip()
+  if line.lstrip()[0] == "-":
+    # Treat a line which starts which is an array element
+    # as two lines:
+    #-----------
+    #     foo:
+    #       - bar:
+    #-----------
+    # becomes:
+    #-----------
+    #     foo:
+    #       0:
+    #         bar:
+    #-----------
+    processLine(indent, "0:")
+    indent = indent + len(line) - len(line.lstrip(" -"))
+    processLine(indent,  line.lstrip(" -"))
+  else:
+   # Not an new-array-item-starting line
+    processLine(indent, line)
+ 
+
+  

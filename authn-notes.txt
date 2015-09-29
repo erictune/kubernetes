@@ -1,0 +1,9 @@
+------------------------------------------------------------------------------
+To use Google's OAuth 2.0 authentication system for user login, you must:
+  - set up a project in the Google Developers Console to obtain OAuth 2.0 credentials,
+  - set a redirect URI, and
+  - (optionally) customize the branding information that your users see on the user-consent screen.
+Q: Do I do this for the master project or the user's VM project? If the latter, can I do that many?
+
+Q: iam.Check.
+

@@ -70,6 +70,49 @@ Notes on behavior and implementation
 - implmented by `openshiftAuthorizer`.
 - Authorize method first check if an action is globally allowed. func (a *openshiftAuthorizer) authorizeWithNamespaceRules(ctx kapi.Context, passedAttributes AuthorizationAttributes)
 
+The applicable Policy rules for a non-namespaced object are just those referenced by ClusterRoleBindings.
+For a namespaced object, it is just those referenced by RoleBindings.
+ClusterRoleBindings just refer to ClusterRoles, not a (namespaced) Role.
+RoleBindings can refer to both ClusterRoles and Roles.
+RoleBindings can only ref Roles in the same namespace.
+
+ClusterRoles can be used to express both (1) permissions that span all namespaces and permissions on non-namespaced objects,
+(2) permissions that are basically templates for a permissions in a specific namespace, and when bound,
+that namespace becomes the argument (actual parameter).
+For beta: clear that up?
+
+When bindings are created/updated, the creator/updater needs to have all the permissions they are granting.
+
+Policy rules are purely additive which allows easily computing whether one role "covers" another role.
+With deny, this is hard. So you need to have a separate set of permissions for who can grant
+what roles.and policy determinations can be made on the basis of those rules that are found.
+
+A users's rules for any operation are their global and current-namespace rules unioned together.
+(Since no deny, no ordering concerns).
+
+
+
+TODO: Rename these to ClusterRole and NamespaceRoles for beta? Or prefer short?
+
+A Role/ClusterRole applies to a User if:
+- the binding is of type User and the User name is the same.
+- the binding is of type Group and the user is in the Group.
+- the binding is of type Serviceaccount and the User is the service account for the current namespace with "service account name".
+
+TODO: cross object validation is discouraged.
+
+Guidelines for reviewers:
+ - be lenient in alpha to favor getting something out, but make notes of all things you want fixed in beta.
+ - beta is attempt to fix those things and get a close to the GA as possible.
+ - if there are big changes, second alpha may be needed.
+
+ - things that can be deferred (but should be recorded):
+  - decide on names, or how to express things in API, or whether a field is useful.
+  - decide on semantics of something (e.g. only once or may happen twice, etc).
+  - return error in alpha for something expected to be rare and hard to implement
+  - less efficient algorithm (but should not slow down cluster if alpha feature not used)
+  - need caching (ditto).
+  - performance impact not understood.
 ### SecurityContexts and SecurityContextConstraints
 
 PolicyRules authorize actions on entire objects.  However, permission to use specific fields in an

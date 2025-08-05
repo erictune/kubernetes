@@ -14,6 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Three simple ideas:
+// (1) Do not enqueue pods with the label if they don't have min pods ready or already placed.
+//     Also error out on pods that request gang
+//     scheduling and are not gang compatible.  So, active queue only holds potential gangs.
+// (2) Sort them, as in coscheduling pluging, so there are no intervening pods.
+// (3) When we see one group pod, also look back in the queue to count how
+//     many active pods are there in the queue that are identical to this pod,
+//     and if so, only place this pod if we can fit N copies.  So, we don't deadlock.
 package scheduler
 
 import (
@@ -63,6 +71,7 @@ const (
 )
 
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
+// NEW: or a group of pods.
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	podInfo, err := sched.NextPod(logger)
@@ -99,6 +108,15 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 
 	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
 
+       /* 
+	var pgPeers = nil
+	pgFullName, pg := pgMgr.GetPodGroup(ctx, podInfo)
+	if pgFullName != "" {
+	    logger.V(4).Info("Ooo! Pod is part of a PodGroup with handle", "pod", klog.KObj(pod), "podGroupWithNs", pgFullName)
+	    logger.V(4).Info("Will also try to schedle N other pods in a row.") // XXX get N
+	    // XXX 
+	    pgPeers = make([]podInfo, 3) // XXX N from above.  Fill with those pods too.  MAke sure they are Equivalent for feasibility.
+*/
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
 	state := framework.NewCycleState()
@@ -114,6 +132,8 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Count how many peers are behind this pod in the queue too.
+        // For the current pod, and each of peers.	 XXX
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
 	if !status.IsSuccess() {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
@@ -154,10 +174,11 @@ func (sched *Scheduler) schedulingCycle(
 	podInfo *framework.QueuedPodInfo,
 	start time.Time,
 	podsToActivate *framework.PodsToActivate,
+	// minCopiesToPlace int,  make sure we can place this many copies, or don't place this pod.  -- we call this with a lower number each time.
 ) (ScheduleResult, *framework.QueuedPodInfo, *fwk.Status) {
 	logger := klog.FromContext(ctx)
 	pod := podInfo.Pod
-	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod)
+	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod) // , minCopiesToPlace
 	if err != nil {
 		defer func() {
 			metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
@@ -184,7 +205,7 @@ func (sched *Scheduler) schedulingCycle(
 		}
 
 		// Run PostFilter plugins to attempt to make the pod schedulable in a future scheduling cycle.
-		result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus)
+		result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus) //, minCopiesToPlace 
 		msg := status.Message()
 		fitError.Diagnosis.PostFilterMsg = msg
 		if status.Code() == fwk.Error {
@@ -452,6 +473,31 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 			Diagnosis:   diagnosis,
 		}
 	}
+
+	// XXX For gang scheduling, we want to see if there are several nodes that can fit a pod just like this one.
+	// if len(additionalPodsToFit) > 0) {
+	//       if len(feasibleNodes == 1+additionalIdenticalPodsToFit) 
+	//         return ScheduleResult{ ... }
+	//       }
+	//     priorityList, err := prioritizeNodesForNPods(ctx, sched.Extenders, fwk, state, pod, feasibleNodes, 1+additionalIdenticalPodsToFit)
+	//     if err != nil {
+	//     	return result, err
+	//     }
+
+	//     host, _, err := selectHosts(priorityList, numberOfHighestScoredNodesToReport, 1+additionalIdenticalPodsToFit)
+	//     trace.Step("Prioritizing done")
+
+	//     return ScheduleResult{
+	//     	    SuggestedHost:  host,
+	//     	    EvaluatedNodes: len(feasibleNodes) + diagnosis.NodeToStatus.Len(),
+	// 	    FeasibleNodes:  len(feasibleNodes),
+	//     }, err
+	//  
+	// }
+	// Problem: if there is a node selector that is different on this pod, then we won't get an accurate count.
+	// Solution 1: tell Kueue it has to turn off doing its own node selection if it wants to get fast gang scheduling.
+	// But it can still get sorting in the active queue to group similar pods.
+	// Option to is to remove node selectors that target node name, on the assumption that they are from Kueue, and run again?
 
 	// When only one node after predicate, just use it.
 	if len(feasibleNodes) == 1 {

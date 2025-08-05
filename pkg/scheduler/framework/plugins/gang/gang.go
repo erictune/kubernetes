@@ -105,11 +105,35 @@ func (pl *Gang) PreEnqueue(ctx context.Context, p *v1.Pod) *fwk.Status {
 		klog.ErrorS(err, "Failed to get pod group min size", "pod", klog.KObj(p))
 		return fwk.NewStatus(fwk.Error, err.Error())
 	}
+	if p.Spec.Affinity != nil {
+		if p.Spec.Affinity.PodAffinity != nil {
+			if len(p.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution) > 0 ||
+				len(p.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
+				return fwk.NewStatus(
+					fwk.UnschedulableAndUnresolvable,
+					fmt.Sprintf("Pods with spec.affinity.podAffinity may not use pod group scheduling."))
+			}
+		}
+		if p.Spec.Affinity.PodAntiAffinity != nil {
+			if len(p.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution) > 0 ||
+				len(p.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
+				return fwk.NewStatus(
+					fwk.UnschedulableAndUnresolvable,
+					fmt.Sprintf("Pods with spec.affinity.podAntiAffinity may not use pod group scheduling."))
+			}
+		}
+	}
+	for _, tsc := range p.Spec.TopologySpreadConstraints {
+		if tsc.WhenUnsatisfiable == v1.DoNotSchedule {
+			return fwk.NewStatus(
+				fwk.UnschedulableAndUnresolvable,
+				fmt.Sprintf("Pods with a spec.topologySpreadConstraint with DoNotSchedule may not pod group scheduling."))
+		}
+	}
 
 	// Count waiting nodes.
 	// TODO: see if this could be made faster by using an indexer on the informer. Coscheduling plugin does this.
 	seenPods, err := pl.podLister.List(labels.Everything())
-	fmt.Printf("XXX %v\n", seenPods)
 	if err != nil {
 		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("invalid pod group spec for groupo %v - min size not an integer", pgFullName))
 	}

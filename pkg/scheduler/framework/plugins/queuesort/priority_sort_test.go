@@ -80,6 +80,18 @@ func TestLess(t *testing.T) {
 			},
 			expected: false, // p2 should be ahead of p1 in the queue
 		},
+		{
+			name: "equal priority. p2 is added to schedulingQ earlier than p1, but p2 in a gang.",
+			p1: &framework.QueuedPodInfo{
+				PodInfo:   mustNewPodInfo(t, st.MakePod().Priority(highPriority).Obj()),
+				Timestamp: t2,
+			},
+			p2: &framework.QueuedPodInfo{
+				PodInfo:   mustNewPodInfo(t, st.MakePod().Priority(highPriority).Label(kPodGroupNameLabelKey, "foo").Obj()),
+				Timestamp: t1,
+			},
+			expected: true, // p1 should be ahead of p2 in the queue
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := prioritySort.Less(tt.p1, tt.p2); got != tt.expected {

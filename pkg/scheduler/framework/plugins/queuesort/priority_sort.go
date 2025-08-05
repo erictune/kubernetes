@@ -46,6 +46,7 @@ func (pl *PrioritySort) Name() string {
 }
 
 
+// XXX Put these somewhere everyone can find.
 func PodGroupFullName(pod *v1.Pod) string {
 	pg, ok := pod.Labels[kPodGroupNameLabelKey]
 	if !ok {

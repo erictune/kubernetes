@@ -110,6 +110,41 @@ func NewFakeFilterPlugin(failedNodeReturnCodeMap map[string]fwk.Code) frameworkr
 	}
 }
 
+// FakeFilterPlugin is a test filter plugin to record how many times its Filter() function have
+// been called, and it returns different 'Code' depending on its internal 'failedNodeReturnCodeMap'.
+type FakeScorePlugin struct {
+	NumScoreCalled int32
+	ScoreMap       map[string]int64
+}
+
+// Name returns name of the plugin.
+func (pl *FakeScorePlugin) Name() string {
+	return "FakeScore"
+}
+
+// Filter invoked at the filter extension point.
+func (pl *FakeScorePlugin) Score(_ context.Context, _ fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) (int64, *fwk.Status) {
+	atomic.AddInt32(&pl.NumScoreCalled, 1)
+
+	if score, ok := pl.ScoreMap[nodeInfo.Node().Name]; ok {
+		return score, nil
+	}
+	return 0, nil
+}
+
+func (pl *FakeScorePlugin) ScoreExtensions() framework.ScoreExtensions {
+	return nil
+}
+
+// NewFakeScorePlugin initializes a fakeScorePlugin and returns it.
+func NewFakeScorePlugin(scoreMap map[string]int64) frameworkruntime.PluginFactory {
+	return func(_ context.Context, _ runtime.Object, _ framework.Handle) (framework.Plugin, error) {
+		return &FakeScorePlugin{
+			ScoreMap: scoreMap,
+		}, nil
+	}
+}
+
 // MatchFilterPlugin is a filter plugin which return Success when the evaluated pod and node
 // have the same name; otherwise return Unschedulable.
 type MatchFilterPlugin struct{}

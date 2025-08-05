@@ -1100,7 +1100,7 @@ func TestSchedulerScheduleOne(t *testing.T) {
 						}
 						queue.Add(logger, item.sendPod)
 
-						sched.SchedulePod = func(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod) (ScheduleResult, error) {
+						sched.SchedulePod = func(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod, _ int) (ScheduleResult, error) {
 							return item.mockScheduleResult, item.injectSchedulingError
 						}
 						sched.FailureHandler = func(ctx context.Context, fwk framework.Framework, p *framework.QueuedPodInfo, status *fwk.Status, ni *framework.NominatingInfo, start time.Time) {
@@ -1454,7 +1454,7 @@ func TestScheduleOneMarksPodAsProcessedBeforePreBind(t *testing.T) {
 					}
 					queue.Add(logger, item.sendPod)
 
-					sched.SchedulePod = func(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod) (ScheduleResult, error) {
+					sched.SchedulePod = func(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod, _ int) (ScheduleResult, error) {
 						return item.mockScheduleResult, item.injectSchedulingError
 					}
 					sched.FailureHandler = func(_ context.Context, fwk framework.Framework, p *framework.QueuedPodInfo, status *fwk.Status, _ *framework.NominatingInfo, _ time.Time) {
@@ -3500,7 +3500,7 @@ func TestSchedulerSchedulePod(t *testing.T) {
 			informerFactory.Start(ctx.Done())
 			informerFactory.WaitForCacheSync(ctx.Done())
 
-			result, err := sched.SchedulePod(ctx, fwk, framework.NewCycleState(), test.pod)
+			result, err := sched.SchedulePod(ctx, fwk, framework.NewCycleState(), test.pod, 1)
 			if err != test.wErr {
 				gotFitErr, gotOK := err.(*framework.FitError)
 				wantFitErr, wantOK := test.wErr.(*framework.FitError)
@@ -4374,6 +4374,161 @@ func TestFairEvaluationForNodes(t *testing.T) {
 		if sched.nextStartNodeIndex != (i+1)*nodesToFind%numAllNodes {
 			t.Errorf("got %d lastProcessedNodeIndex, want %d", sched.nextStartNodeIndex, (i+1)*nodesToFind%numAllNodes)
 		}
+	}
+}
+
+// Tests the "numCopies" argument to schedulePod()
+func TestSchedulePod_NumCopies(t *testing.T) {
+	empty := struct{}{}
+	node2or4 := map[string]struct{}{"node2": empty, "node4": empty}
+	anyNode := map[string]struct{}{"node1": empty, "node2": empty, "node3": empty, "node4": empty}
+
+	fourNodes := []*v1.Node{
+		st.MakeNode().Name("node1").Obj(),
+		st.MakeNode().Name("node2").Obj(),
+		st.MakeNode().Name("node3").Obj(),
+		st.MakeNode().Name("node4").Obj(),
+	}
+	aPod := st.MakePod().Name("p1").UID("p1").Obj()
+	tests := []struct {
+		name          string
+		nodes         []*v1.Node
+		pod           *v1.Pod
+		numCopies     int
+		filterResults map[string]fwk.Code
+		scores        map[string]int64
+		wantErr       bool
+		wantHostIn    map[string]struct{}
+	}{
+		{
+			name:      "not enough feasible nodes for one copy",
+			nodes:     fourNodes,
+			pod:       aPod,
+			numCopies: 1,
+			filterResults: map[string]fwk.Code{
+				"node1": fwk.Unschedulable,
+				"node2": fwk.Unschedulable,
+				"node3": fwk.Unschedulable,
+				"node4": fwk.Unschedulable,
+			},
+			wantErr: true,
+		},
+		{
+			name:      "exactly enough feasible nodes for one copy",
+			nodes:     fourNodes,
+			pod:       aPod,
+			numCopies: 1,
+			filterResults: map[string]fwk.Code{
+				"node1": fwk.Unschedulable,
+				// node2 okay
+				"node3": fwk.Unschedulable,
+				"node4": fwk.Unschedulable,
+			},
+			scores:  map[string]int64{"node2": 5},
+			wantErr: false,
+			// Offset of nodes is randomized, and when exactly numCopies are found, we don't pick the best node, so either can be returned.
+			wantHostIn: node2or4,
+		},
+		{
+			name:      "not enough feasible nodes for 2 copies",
+			nodes:     fourNodes,
+			pod:       aPod,
+			numCopies: 2,
+			filterResults: map[string]fwk.Code{
+				"node1": fwk.Unschedulable,
+				// node2 okay
+				"node3": fwk.Unschedulable,
+				"node4": fwk.Unschedulable,
+			},
+			scores:  map[string]int64{"node2": 5},
+			wantErr: true,
+		},
+		{
+			name:          "more than enough feasible nodes for 2 copies",
+			nodes:         fourNodes,
+			pod:           aPod,
+			numCopies:     2,
+			filterResults: map[string]fwk.Code{
+				// no nodes filtered out
+			},
+			scores:     map[string]int64{"node1": 10, "node2": 5, "node3": 15, "node4": 20},
+			wantErr:    false,
+			wantHostIn: anyNode,
+		},
+		{
+			name:      "exactly enough feasible nodes for 2 copies",
+			nodes:     fourNodes,
+			pod:       aPod,
+			numCopies: 2,
+			filterResults: map[string]fwk.Code{
+				"node1": fwk.Unschedulable,
+				"node3": fwk.Unschedulable,
+			},
+			scores:     map[string]int64{"node2": 15, "node4": 10},
+			wantErr:    false,
+			wantHostIn: node2or4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			cache := internalcache.New(ctx, time.Duration(0), nil)
+			cache.AddPod(logger, tt.pod)
+			var nodes []*v1.Node
+			for _, node := range tt.nodes {
+				nodes = append(nodes, node)
+				cache.AddNode(logger, node)
+			}
+
+			registerPlugins := []tf.RegisterPluginFunc{
+				tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+				tf.RegisterFilterPlugin("FakeFilter", tf.NewFakeFilterPlugin(tt.filterResults)),
+				tf.RegisterScorePlugin("FakeScore", tf.NewFakeScorePlugin(tt.scores), 1),
+				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+			}
+
+			cs := clientsetfake.NewClientset()
+			informerFactory := informers.NewSharedInformerFactory(cs, 0)
+
+			snapshot := internalcache.NewSnapshot(nil, tt.nodes)
+			fwk, err := tf.NewFramework(
+				ctx,
+				registerPlugins, "",
+				frameworkruntime.WithSnapshotSharedLister(snapshot),
+				frameworkruntime.WithInformerFactory(informerFactory),
+				frameworkruntime.WithPodNominator(internalqueue.NewSchedulingQueue(nil, informerFactory)),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			sched := &Scheduler{
+				Cache:                    cache,
+				nodeInfoSnapshot:         snapshot,
+				percentageOfNodesToScore: 100, // XXX TODO set percentage of nodes to score higher with podset scheduling.
+			}
+			sched.applyDefaultHandlers()
+
+			result, err := sched.SchedulePod(ctx, fwk, framework.NewCycleState(), tt.pod, tt.numCopies)
+
+			if tt.wantErr {
+				if _, ok := err.(*framework.FitError); !ok {
+					t.Fatalf("expected a FitError but got %T: %v", err, err)
+				}
+			} else if err != nil {
+				t.Fatalf("expected no error but got: %v", err)
+			}
+
+			if !tt.wantErr {
+				if _, exists := tt.wantHostIn[result.SuggestedHost]; !exists {
+					t.Errorf("unexpected host, want one of %q, got %q", tt.wantHostIn, result.SuggestedHost)
+				}
+			}
+		})
 	}
 }
 

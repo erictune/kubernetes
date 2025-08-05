@@ -14,6 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Three simple ideas:
+// (1) Do not enqueue pods with the label if they don't have min pods ready or already placed.
+//
+//	Also error out on pods that request gang
+//	scheduling and are not gang compatible.  So, active queue only holds potential gangs.
+//
+// (2) Sort them, as in coscheduling pluging, so there are no intervening pods.
+// (3) When we see one group pod, also look back in the queue to count how
+//
+//	many active pods are there in the queue that are identical to this pod,
+//	and if so, only place this pod if we can fit N copies.  So, we don't deadlock.
 package scheduler
 
 import (
@@ -63,6 +74,7 @@ const (
 )
 
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
+// NEW: or a group of pods.
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	podInfo, err := sched.NextPod(logger)
@@ -99,6 +111,15 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 
 	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
 
+	/*
+		var pgPeers = nil
+		pgFullName, pg := pgMgr.GetPodGroup(ctx, podInfo)
+		if pgFullName != "" {
+		    logger.V(4).Info("Ooo! Pod is part of a PodGroup with handle", "pod", klog.KObj(pod), "podGroupWithNs", pgFullName)
+		    logger.V(4).Info("Will also try to schedle N other pods in a row.") // XXX get N
+		    // XXX
+		    pgPeers = make([]podInfo, 3) // XXX N from above.  Fill with those pods too.  MAke sure they are Equivalent for feasibility.
+	*/
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
 	state := framework.NewCycleState()
@@ -114,6 +135,8 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Count how many peers are behind this pod in the queue too.
+	// For the current pod, and each of peers.	 XXX
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
 	if !status.IsSuccess() {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
@@ -154,10 +177,11 @@ func (sched *Scheduler) schedulingCycle(
 	podInfo *framework.QueuedPodInfo,
 	start time.Time,
 	podsToActivate *framework.PodsToActivate,
+	// minCopiesToPlace int,  make sure we can place this many copies, or don't place this pod.  -- we call this with a lower number each time.
 ) (ScheduleResult, *framework.QueuedPodInfo, *fwk.Status) {
 	logger := klog.FromContext(ctx)
 	pod := podInfo.Pod
-	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod)
+	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod, 1)
 	if err != nil {
 		defer func() {
 			metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
@@ -184,7 +208,7 @@ func (sched *Scheduler) schedulingCycle(
 		}
 
 		// Run PostFilter plugins to attempt to make the pod schedulable in a future scheduling cycle.
-		result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus)
+		result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus) //, minCopiesToPlace
 		msg := status.Message()
 		fitError.Diagnosis.PostFilterMsg = msg
 		if status.Code() == fwk.Error {
@@ -427,7 +451,7 @@ func (sched *Scheduler) skipPodSchedule(ctx context.Context, fwk framework.Frame
 // schedulePod tries to schedule the given pod to one of the nodes in the node list.
 // If it succeeds, it will return the name of the node.
 // If it fails, it will return a FitError with reasons.
-func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
+func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod, numCopies int) (result ScheduleResult, err error) {
 	trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pod.Namespace}, utiltrace.Field{Key: "name", Value: pod.Name})
 	defer trace.LogIfLong(100 * time.Millisecond)
 	if err := sched.Cache.UpdateSnapshot(klog.FromContext(ctx), sched.nodeInfoSnapshot); err != nil {
@@ -445,7 +469,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 	}
 	trace.Step("Computing predicates done")
 
-	if len(feasibleNodes) == 0 {
+	if len(feasibleNodes) < numCopies {
 		return result, &framework.FitError{
 			Pod:         pod,
 			NumAllNodes: sched.nodeInfoSnapshot.NumNodes(),
@@ -453,15 +477,19 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		}
 	}
 
-	// When only one node after predicate, just use it.
-	if len(feasibleNodes) == 1 {
+	// Exit early if there are exactly enough nodes.  For normal pods, this is 1 node. For the podset case,
+	// just check that the subsequent pods have room (numCopies feasible nodes), but only return one best node for this pod.
+	//
+	// TODO: for TAS, we need to handle mutually-exclusive alternatives when counting if there are enough feasibleNodes.
+	if len(feasibleNodes) == numCopies {
 		return ScheduleResult{
 			SuggestedHost:  feasibleNodes[0].Node().Name,
 			EvaluatedNodes: 1 + diagnosis.NodeToStatus.Len(),
-			FeasibleNodes:  1,
+			FeasibleNodes:  1, // TODO: how is this used, and should 1 or numCopies be returned here?
 		}, nil
 	}
 
+	// TODO: for TAS, we need to pick between mutually-exclusive alternatives in prioritizeNodes.
 	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
 	if err != nil {
 		return result, err

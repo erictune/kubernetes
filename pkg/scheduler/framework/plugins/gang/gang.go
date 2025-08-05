@@ -18,7 +18,6 @@ package gang
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -26,39 +25,45 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	//"k8s.io/klog/v2"
+	"k8s.io/klog/v2"
 
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
-	//"k8s.io/kubernetes/pkg/scheduler/util"
+	//corev1 "k8s.io/api/core/v1"
+	listerscorev1 "k8s.io/client-go/listers/core/v1"
 )
 
-// XXX Put these somewhere everyone can find.
-const kPodGroupNameLabelKey = "scheduler.k8s.io/pod-group-name"
-const kPodGroupMinSizeLabelKey = "scheduler.k8s.io/pod-group-min-size"
+const (
+	// PodGroupNameLabelKey is the label key used to identify the pod group name.
+	PodGroupNameLabelKey = "scheduler.k8s.io/pod-group-name"
+	// PodGroupMinSizeLabelKey is the label key used to identify the minimum number of pods in a pod group.
+	PodGroupMinSizeLabelKey = "scheduler.k8s.io/pod-group-min-size"
+)
 
 // Name of the plugin used in the plugin registry and configurations.
 const Name = names.Gang
 
-// XXX Put these somewhere everyone can find.
+// PodGroupFullName returns the full name of the pod group for a given pod.
 func PodGroupFullName(pod *v1.Pod) string {
-	pg, ok := pod.Labels[kPodGroupNameLabelKey]
+	pg, ok := pod.Labels[PodGroupNameLabelKey]
 	if !ok {
 		return ""
 	}
-        parts := []string{pod.Namespace, pg}
+	parts := []string{pod.Namespace, pg}
 	return strings.Join(parts, "/")
 }
-func PodGroupMinSize(pod *v1.Pod) (int, error)  {
-	pgmsStr, ok := pod.Labels[kPodGroupMinSizeLabelKey]
+
+// PodGroupMinSize returns the minimum size of the pod group for a given pod.
+func PodGroupMinSize(pod *v1.Pod) (int, error) {
+	pgmsStr, ok := pod.Labels[PodGroupMinSizeLabelKey]
 	if !ok {
 		return 0, nil // No minimum.
 	}
 	pgmn, err := strconv.Atoi(pgmsStr)
 	if err != nil {
-		return 0, errors.New("Invalid integer for pod group min size")
+		return 0, fmt.Errorf("invalid integer for pod group min size: %w", err)
 	}
 	return pgmn, nil
 }
@@ -67,7 +72,9 @@ func PodGroupMinSize(pod *v1.Pod) (int, error)  {
 // and if so, if the minimum number of pods for that group have been seen by
 // the scheduler's informers.
 type Gang struct {
-	handle framework.Handle
+	context   context.Context
+	handle    framework.Handle
+	podLister listerscorev1.PodLister
 }
 
 var _ framework.PreEnqueuePlugin = &Gang{}
@@ -76,6 +83,8 @@ func (pl *Gang) Name() string {
 	return Name
 }
 
+// PreEnqueue checks if the pod belongs to a gang and if the gang is ready to be scheduled.
+//
 // We will not begin scheduling any pods of a gang if we have not observed
 // at least the minimum number of such pods. This should keep incomplete gangs
 // out of the ready queue.
@@ -93,23 +102,23 @@ func (pl *Gang) PreEnqueue(ctx context.Context, p *v1.Pod) *fwk.Status {
 	}
 	pgMinSize, err := PodGroupMinSize(p)
 	if err != nil {
-		return nil
-		// XXX Log a more helpful error
+		klog.ErrorS(err, "Failed to get pod group min size", "pod", klog.KObj(p))
+		return fwk.NewStatus(fwk.Error, err.Error())
 	}
 
 	// Count waiting nodes.
 	// TODO: see if this could be made faster by using an indexer on the informer. Coscheduling plugin does this.
-	// TODO: make this informer use replacable for testing.
-	seenPods, err := pl.handle.SharedInformerFactory().Core().V1().Pods().Lister().List(labels.Everything())
+	seenPods, err := pl.podLister.List(labels.Everything())
+	fmt.Printf("XXX %v\n", seenPods)
 	if err != nil {
-		return nil // TODO: return appropriate status.
+		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("invalid pod group spec for groupo %v - min size not an integer", pgFullName))
 	}
 	pgSeenPods := 0
 	for _, pp := range seenPods {
 		if PodGroupFullName(pp) == pgFullName {
 			pgSeenPods += 1
 		}
-	} 
+	}
 	if pgSeenPods < pgMinSize {
 		return fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("waiting for enough pods in pod group %v (seen: %v, min: %v)", pgFullName, pgSeenPods, pgMinSize))
 	}
@@ -117,9 +126,11 @@ func (pl *Gang) PreEnqueue(ctx context.Context, p *v1.Pod) *fwk.Status {
 }
 
 // New initializes a new plugin and returns it.
-func New(_ context.Context, _ runtime.Object, h framework.Handle, fts feature.Features) (framework.Plugin, error) {
+func New(c context.Context, _ runtime.Object, h framework.Handle, fts feature.Features) (framework.Plugin, error) {
 	return &Gang{
-		handle: h,
+		context:   c,
+		handle:    h,
+		podLister: h.SharedInformerFactory().Core().V1().Pods().Lister(),
 	}, nil
 }
 

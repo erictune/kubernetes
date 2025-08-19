@@ -23,6 +23,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	psutil "k8s.io/kubernetes/pkg/scheduler/util/podset"
 )
 
 func TestLess(t *testing.T) {
@@ -79,6 +80,31 @@ func TestLess(t *testing.T) {
 				Timestamp: t1,
 			},
 			expected: false, // p2 should be ahead of p1 in the queue
+		},
+		// TODO: make each above test case get run with enablePodSetScheduling on and off.
+		{
+			name: "equal priority. p2 is added to schedulingQ earlier than p1, but p2 in a podset so it sorts",
+			p1: &framework.QueuedPodInfo{
+				PodInfo:   mustNewPodInfo(t, st.MakePod().Priority(highPriority).Obj()),
+				Timestamp: t2,
+			},
+			p2: &framework.QueuedPodInfo{
+				PodInfo:   mustNewPodInfo(t, st.MakePod().Priority(highPriority).Label(psutil.PodSetNameLabelKey, "foo").Obj()),
+				Timestamp: t1,
+			},
+			expected: false, // p1 should be ahead of p2 in the queue since plain pods sort ahead of podset pods.
+		},
+		{
+			name: "equal priority. both podset pod is added to schedulingQ earlier than p1, but p2 in a podset so it sorts later",
+			p1: &framework.QueuedPodInfo{
+				PodInfo:   mustNewPodInfo(t, st.MakePod().Priority(highPriority).Obj()),
+				Timestamp: t2,
+			},
+			p2: &framework.QueuedPodInfo{
+				PodInfo:   mustNewPodInfo(t, st.MakePod().Priority(highPriority).Label(psutil.PodSetNameLabelKey, "foo").Obj()),
+				Timestamp: t1,
+			},
+			expected: false, // p1 should be ahead of p2 in the queue since plain pods sort ahead of podset pods.
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

@@ -30,6 +30,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	psutil "k8s.io/kubernetes/pkg/scheduler/util/podset"
 	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
@@ -46,7 +47,7 @@ func (mpl *MockPodLister) Pods(namespace string) listerscorev1.PodNamespaceListe
 
 // New initializes a new plugin for testing and returns it.
 func NewTestPlugin(c context.Context, allpods []*corev1.Pod, fts feature.Features) (framework.Plugin, error) {
-	return &Gang{
+	return &PodSets{
 		context:   c,
 		handle:    nil,
 		podLister: &MockPodLister{l: allpods},
@@ -54,19 +55,14 @@ func NewTestPlugin(c context.Context, allpods []*corev1.Pod, fts feature.Feature
 }
 
 func TestPreEnqueue(t *testing.T) {
+	// This test does not try to cover all possible cases for pod equivalence or for pod compatibility.  Those are covered in
+	// the k8s.io/pkg/scheduler/util/podset unit tests.
 	pSolo := st.MakePod().Name("p").Namespace("ns1").Obj()
-	pSoloAffAntiAffSpread := st.MakePod().Name("p").Namespace("ns1").PodAffinity("foo", nil, st.PodAffinityWithRequiredReq).SpreadConstraint(1, "foo", corev1.DoNotSchedule, nil, nil, nil, nil, []string{}).Obj()
-	pGang1 := st.MakePod().Name("pgang-1").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").Obj()
-	pGang2 := st.MakePod().Name("pgang-2").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").Obj()
-	pGang3 := st.MakePod().Name("pgang-3").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").Obj()
-	pGangWithPA1 := st.MakePod().Name("pgang-1").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").PodAffinity("foo", nil, st.PodAffinityWithRequiredReq).Obj()
-	pGangWithPA2 := st.MakePod().Name("pgang-2").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").PodAffinity("foo", nil, st.PodAffinityWithRequiredReq).Obj()
-	pGangWithPAA1 := st.MakePod().Name("pgang-1").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").PodAntiAffinity("foo", nil, st.PodAntiAffinityWithRequiredPreferredReq).Obj()
-	pGangWithPAA2 := st.MakePod().Name("pgang-2").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").PodAntiAffinity("foo", nil, st.PodAntiAffinityWithRequiredPreferredReq).Obj()
-	pGangWithHardTSC1 := st.MakePod().Name("pgang-1").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").SpreadConstraint(5, "foo", corev1.DoNotSchedule, nil, nil, nil, nil, []string{}).Obj()
-	pGangWithHardTSC2 := st.MakePod().Name("pgang-2").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").SpreadConstraint(5, "foo", corev1.DoNotSchedule, nil, nil, nil, nil, []string{}).Obj()
-	pGangWithSoftTSC1 := st.MakePod().Name("pgang-1").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").SpreadConstraint(5, "foo", corev1.ScheduleAnyway, nil, nil, nil, nil, []string{}).Obj()
-	pGangWithSoftTSC2 := st.MakePod().Name("pgang-2").Namespace("ns1").Label(PodGroupMinSizeLabelKey, "2").Label(PodGroupNameLabelKey, "grp-foo").SpreadConstraint(5, "foo", corev1.ScheduleAnyway, nil, nil, nil, nil, []string{}).Obj()
+	pSolo2 := st.MakePod().Name("q").Namespace("ns1").Obj()
+	pPodSet := st.MakePod().Name("ps-1").Namespace("ns1").Label(psutil.PodSetSizeLabelKey, "2").Label(psutil.PodSetNameLabelKey, "grp-foo").Obj()
+	pPodSet2 := st.MakePod().Name("ps-2").Namespace("ns1").Label(psutil.PodSetSizeLabelKey, "2").Label(psutil.PodSetNameLabelKey, "grp-foo").Obj()
+	pPodSetNotIdentical := st.MakePod().Name("ps-3").Namespace("ns2").Label(psutil.PodSetSizeLabelKey, "2").Label(psutil.PodSetNameLabelKey, "grp-foo").Obj()
+	pPodSetIncompatible := st.MakePod().Name("ps-1").Namespace("ns1").Label(psutil.PodSetSizeLabelKey, "2").Label(psutil.PodSetNameLabelKey, "grp-foo").PodAffinity("foo", nil, st.PodAffinityWithRequiredReq).Obj()
 
 	tests := []struct {
 		name    string
@@ -75,70 +71,52 @@ func TestPreEnqueue(t *testing.T) {
 		want    *fwk.Status
 	}{
 		{
-			name:    "pod not in a pod group; no other pods present.",
+			name:    "pod not in a podset; no other pods present.",
 			pod:     pSolo,
 			allpods: []*corev1.Pod{pSolo},
 			want:    nil,
 		},
 		{
-			name:    "pod not in a pod group; one pod from a podgroup is present.",
+			name:    "pod not in a podset; one pod from a podgroup is present.",
 			pod:     pSolo,
-			allpods: []*corev1.Pod{pSolo, pGang1},
+			allpods: []*corev1.Pod{pSolo, pPodSet},
 			want:    nil,
 		},
 		{
-			name:    "pod in a pod group; no other pods present.",
-			pod:     pGang1,
-			allpods: []*corev1.Pod{pGang1},
-			want:    fwk.NewStatus(fwk.Unschedulable, "waiting for enough pods in pod group ns1/grp-foo (seen: 1, min: 2)"),
+			name:    "pod in a podset; no other pods present.",
+			pod:     pPodSet,
+			allpods: []*corev1.Pod{pPodSet},
+			want:    fwk.NewStatus(fwk.Unschedulable, "waiting for enough pods in podset ns1/grp-foo (seen: 1, min: 2)"),
 		},
 		{
-			name:    "pod in a pod group; unrelated pods are in the system, but no peers",
-			pod:     pGang1,
-			allpods: []*corev1.Pod{pSolo, pGang1},
-			want:    fwk.NewStatus(fwk.Unschedulable, "waiting for enough pods in pod group ns1/grp-foo (seen: 1, min: 2)"),
+			name:    "pod in a podset; unrelated pods are in the system, but no peers",
+			pod:     pPodSet,
+			allpods: []*corev1.Pod{pSolo, pPodSet, pSolo2},
+			want:    fwk.NewStatus(fwk.Unschedulable, "waiting for enough pods in podset ns1/grp-foo (seen: 1, min: 2)"),
 		},
 		{
-			name:    "pod in a pod group; one peers present.",
-			pod:     pGang1,
-			allpods: []*corev1.Pod{pGang2, pSolo, pGang1},
+			name:    "both pods from a podset of size 2",
+			pod:     pPodSet,
+			allpods: []*corev1.Pod{pPodSet, pPodSet2},
 			want:    nil,
 		},
 		{
-			name:    "pod in a pod group; two peers present.",
-			pod:     pGang1,
-			allpods: []*corev1.Pod{pGang2, pSolo, pGang1, pGang3},
-			want:    nil,
+			name:    "pod asking for podset but uses disallowed spec",
+			pod:     pPodSetIncompatible,
+			allpods: []*corev1.Pod{pPodSetIncompatible},
+			want:    fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "pod incompatible with podset scheduling:  pods with spec.affinity.podAffinity may not be in a podset"),
 		},
 		{
-			name:    "pod not in a pod group with affinity; no other pods present; affinity, anti-affinity, topology spreading.",
-			pod:     pSoloAffAntiAffSpread,
-			allpods: []*corev1.Pod{pSoloAffAntiAffSpread},
-			want:    nil,
+			name:    "pod asking for podset, but does not match the other pod in the podset",
+			pod:     pPodSet,
+			allpods: []*corev1.Pod{pPodSet, pPodSetNotIdentical},
+			want:    fwk.NewStatus(fwk.Unschedulable, "waiting for enough pods in podset ns1/grp-foo (seen: 1, min: 2)"),
 		},
 		{
-			name:    "pod in a sufficient pod group with affinity",
-			pod:     pGangWithPA1,
-			allpods: []*corev1.Pod{pGangWithPA1, pGangWithPA2},
-			want:    fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "Pods with spec.affinity.podAffinity may not use pod group scheduling."),
-		},
-		{
-			name:    "pod in a sufficient pod group with anti-affinity",
-			pod:     pGangWithPAA1,
-			allpods: []*corev1.Pod{pGangWithPAA1, pGangWithPAA2},
-			want:    fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "Pods with spec.affinity.podAntiAffinity may not use pod group scheduling."),
-		},
-		{
-			name:    "pod in a sufficient pod group with hard spreading",
-			pod:     pGangWithHardTSC1,
-			allpods: []*corev1.Pod{pGangWithHardTSC1, pGangWithHardTSC2},
-			want:    fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "Pods with a spec.topologySpreadConstraint with DoNotSchedule may not pod group scheduling."),
-		},
-		{
-			name:    "pod in a sufficient pod group with soft spreading",
-			pod:     pGangWithSoftTSC1,
-			allpods: []*corev1.Pod{pGangWithSoftTSC1, pGangWithSoftTSC2},
-			want:    nil,
+			name:    "pod asking for podset, but does not match the other pod in the podset, reversed",
+			pod:     pPodSet,
+			allpods: []*corev1.Pod{pPodSetNotIdentical, pPodSet},
+			want:    fwk.NewStatus(fwk.Unschedulable, "waiting for enough pods in podset ns1/grp-foo (seen: 1, min: 2)"),
 		},
 	}
 

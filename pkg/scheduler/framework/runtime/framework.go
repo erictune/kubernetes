@@ -941,6 +941,8 @@ func (f *frameworkImpl) runFilterPlugin(ctx context.Context, pl framework.Filter
 
 // RunPostFilterPlugins runs the set of configured PostFilter plugins until the first
 // Success, Error or UnschedulableAndUnresolvable is met; otherwise continues to execute all plugins.
+
+// XXX pass in numCopies to support preemption of PodSets.
 func (f *frameworkImpl) RunPostFilterPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, filteredNodeStatusMap framework.NodeToStatusReader) (_ *framework.PostFilterResult, status *fwk.Status) {
 	startTime := time.Now()
 	defer func() {
@@ -963,6 +965,12 @@ func (f *frameworkImpl) RunPostFilterPlugins(ctx context.Context, state fwk.Cycl
 			logger := klog.LoggerWithName(logger, pl.Name())
 			ctx = klog.NewContext(ctx, logger)
 		}
+		// XXX Need to pass in a count here to at least the gang scheduling plugin.
+		// OR I could fake out the node status map to remove each pod, trusting plugins to respect it.
+		// Or I could add some selector to the pod to make it not go on the nodes already selected?
+		// But that won't work for MultiPostFilter.
+		// So, maybe just change the plugin interface? Require PostFilterN support for PodSet.
+		// Or add my own gang plugin that copies the defaultpreemption plugin, but also looks for N copies!!!
 		r, s := f.runPostFilterPlugin(ctx, pl, state, pod, filteredNodeStatusMap)
 		if s.IsSuccess() {
 			return r, s
@@ -986,6 +994,7 @@ func (f *frameworkImpl) RunPostFilterPlugins(ctx context.Context, state fwk.Cycl
 	return result, fwk.NewStatus(fwk.Unschedulable, reasons...).WithPlugin(rejectorPlugin)
 }
 
+// XXX pass in count here.
 func (f *frameworkImpl) runPostFilterPlugin(ctx context.Context, pl framework.PostFilterPlugin, state fwk.CycleState, pod *v1.Pod, filteredNodeStatusMap framework.NodeToStatusReader) (*framework.PostFilterResult, *fwk.Status) {
 	if !state.ShouldRecordPluginMetrics() {
 		return pl.PostFilter(ctx, state, pod, filteredNodeStatusMap)

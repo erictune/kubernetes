@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Three simple ideas:
-// (1) Do not enqueue pods with the label if they don't have min pods ready or already placed.
+// Outline of PodSet support:
+// (1) In PreEnqueue, do not enqueue podset pods that are incompatible or non-identical.
+// (2) In PreEnqueue, do not enqueue any podset pods if not all are seen yet.
+// Due to 1 and 2, the active queue only holds complete podsets that are ready to schedule.
+// (3) Sort podset pods, so there are no intervening pods.
+// (4) When doing ScheduleOne, count the number of pods in the gang that are next in the queue.
 //
-//	Also error out on pods that request gang
-//	scheduling and are not gang compatible.  So, active queue only holds potential gangs.
+//	which we can get by peeking into the active queue.
 //
-// (2) Sort them, as in coscheduling pluging, so there are no intervening pods.
-// (3) When we see one group pod, also look back in the queue to count how
-//
-//	many active pods are there in the queue that are identical to this pod,
-//	and if so, only place this pod if we can fit N copies.  So, we don't deadlock.
+// (5) after Filtering the first pod of the podset, make sure there are N, not just 1, valid machines for it to go on.
+// This prevents going further if there is no room.
+// (6) if the first pod fails, send everything in the gang to the backoff queue(?).
+// (7) During preemption ensure enough nodes can be freed through preemption.
 package scheduler
 
 import (
@@ -52,6 +54,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/util"
+	psutil "k8s.io/kubernetes/pkg/scheduler/util/podset"
 	utiltrace "k8s.io/utils/trace"
 )
 
@@ -109,17 +112,43 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		return
 	}
 
+	// If this is a podset pod, check if it is the first one (how?)
+
+	// XXX Several options on what to do here:
+	// 1: Count how many behind us in the group, and pass this into schedulingCycle, so it can check for that many.
+	// 2: Grab them all now here and do a for loop around scheduling cycle in this function.
+	// 3: Grab them all now here and pass the array into schedulingCycle.
+	// 4: The QueuedPodInfo could hold the whole podset as a single list, with the whole list having the same lifetime.
+	//
+	// For now, we are trying option 1.  As a follow up I would like to do 3, so it can call a MultiFilter function.
+	// Eventually, I want to do 4.
+
 	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
 
-	/*
-		var pgPeers = nil
-		pgFullName, pg := pgMgr.GetPodGroup(ctx, podInfo)
-		if pgFullName != "" {
-		    logger.V(4).Info("Ooo! Pod is part of a PodGroup with handle", "pod", klog.KObj(pod), "podGroupWithNs", pgFullName)
-		    logger.V(4).Info("Will also try to schedle N other pods in a row.") // XXX get N
-		    // XXX
-		    pgPeers = make([]podInfo, 3) // XXX N from above.  Fill with those pods too.  MAke sure they are Equivalent for feasibility.
-	*/
+	// peersBehind is zero for normal pods, and equal to the number of peers directly behind it in the active queue for podset pods.
+	//
+	// Typically, the first pod is handled by ScheduleOne with N-1 pods behind it where N is the size of the podset.
+	// Then when the next pod is handled, there are N-2 behind it, and so on.  The check for the first pod is the one that
+	// ensures the whole podset can schedule at once.  The subsequent check is  superflouous in the common case.
+	// However, it simplifies the implementation in a couple of ways:
+	// - Don't need to track which is the "first" pod, which is hard in a distributed system, and when pods could be deleted at any time.
+	// - If there is a bug where pods are not in order as intended, then we may recover anyway.
+	// - If the controller makes more pods later, we may successfully place them (but not guaranteed).
+	var peersBehind int = 0
+
+	if psutil.IsPodSetPod(pod) {
+		logger.V(4).Info("Pod is in podset", "podSetFullName", psutil.PodSetFullName(pod))
+		// Do I need a lock to call this?
+		for _, p := range sched.SchedulingQueue.PodsInActiveQ() {
+			if psutil.IsPodSetPod(p) && psutil.PodSetFullName(p) == psutil.PodSetFullName(pod) {
+				peersBehind += 1
+			} else {
+				break
+			}
+		}
+		logger.V(4).Info("Pod is trailed by peers", "peersBehind", peersBehind, "podName", pod.Name)
+	}
+
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
 	state := framework.NewCycleState()
@@ -135,11 +164,13 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Count how many peers are behind this pod in the queue too.
-	// For the current pod, and each of peers.	 XXX
-	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
+	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate, 1+peersBehind)
 	if !status.IsSuccess() {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+		// XXX TODO: skip all "peersBehind" pods behind us by Pop() and Done() each one (but what if we block on Pop?)
+		// for i in range peersBehind {
+		//		Pop and Done - no need to set a reason?
+		// }
 		return
 	}
 
@@ -177,11 +208,11 @@ func (sched *Scheduler) schedulingCycle(
 	podInfo *framework.QueuedPodInfo,
 	start time.Time,
 	podsToActivate *framework.PodsToActivate,
-	// minCopiesToPlace int,  make sure we can place this many copies, or don't place this pod.  -- we call this with a lower number each time.
+	minCopies int,
 ) (ScheduleResult, *framework.QueuedPodInfo, *fwk.Status) {
 	logger := klog.FromContext(ctx)
 	pod := podInfo.Pod
-	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod, 1)
+	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod, minCopies)
 	if err != nil {
 		defer func() {
 			metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
@@ -207,8 +238,26 @@ func (sched *Scheduler) schedulingCycle(
 			return ScheduleResult{}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
 		}
 
+		// XXX TODO: implement preemption.
+		// - Add a PostFilterN interface that returns both a nomiated node and a count of additional candidates found by"
+		// 		"func (ev *Evaluator) Preempt(...)" in preemption.go
+		// - Implement that interface, reussing most of the preemption.go code.
+		// - require such a plugin for podsets to do preemption.  If users want to  have preemption work for podsets and replace the
+		//   the default PostFilter plugin, then they also need to provide a PostFilterN plugin.
+		// 1) add a PostFilterN interface for plugins that support PostFilter returning multiple results and check if all plugins suppor that.
+		// e.g. like this:
+
+		/*
+			if !schedFramework.HasPostFilterNPlugins() && isPodSet {
+				logger.V(3).Info("RegisteredPostFilter plugins are registered, and pod is part of a podset, so no preemption will be performed")
+				return ScheduleResult{}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
+			}
+			if isPodSet {
+				// Do something like the code below (up to XXX TO HERE) but with handling for numCopies.
+		*/
+
 		// Run PostFilter plugins to attempt to make the pod schedulable in a future scheduling cycle.
-		result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus) //, minCopiesToPlace
+		result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus)
 		msg := status.Message()
 		fitError.Diagnosis.PostFilterMsg = msg
 		if status.Code() == fwk.Error {
@@ -223,6 +272,7 @@ func (sched *Scheduler) schedulingCycle(
 		}
 		return ScheduleResult{nominatingInfo: nominatingInfo}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
 	}
+	// XXX TO HERE
 
 	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
 	// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
